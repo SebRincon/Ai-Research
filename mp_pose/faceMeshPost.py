@@ -5,6 +5,14 @@ mp_drawing_styles = mp.solutions.drawing_styles
 mp_holistic = mp.solutions.holistic
 mp_face_mesh = mp.solutions.face_mesh
 
+import logging
+import rerun as rr
+import numpy as np
+import numpy.typing as npt
+from contextlib import closing
+from dataclasses import dataclass
+from typing import Any, Final, Iterator, Optional
+from rerun.log.annotation import AnnotationInfo, ClassDescription
 
 # For webcam input:
 cap = cv2.VideoCapture(0)
@@ -70,20 +78,6 @@ with mp_face_mesh.FaceMesh(
         
         if results.multi_face_landmarks:
           for face_landmarks in results.multi_face_landmarks:
-            # mp_drawing.draw_landmarks(
-            #     image=image,
-            #     landmark_list=face_landmarks,
-            #     connections=mp_face_mesh.FACEMESH_TESSELATION,
-            #     landmark_drawing_spec=None,
-            #     connection_drawing_spec=mp_drawing_styles
-            #     .get_default_face_mesh_tesselation_style())
-            # mp_drawing.draw_landmarks(
-            #     image=image,
-            #     landmark_list=face_landmarks,
-            #     connections=mp_face_mesh.FACEMESH_CONTOURS,
-            #     landmark_drawing_spec=None,
-            #     connection_drawing_spec=mp_drawing_styles
-            #     .get_default_face_mesh_contours_style())
             mp_drawing.draw_landmarks(
                 image=image,
                 landmark_list=face_landmarks,
@@ -98,4 +92,97 @@ with mp_face_mesh.FaceMesh(
 cap.release()
 
 
+
+
+def track_pose(video_path: str, segment: bool) -> None:
+    mp_pose = mp.solutions.pose
+
+    rr.log_annotation_context(
+        "/",
+        ClassDescription(
+            info=AnnotationInfo(label="Person"),
+            keypoint_annotations=[AnnotationInfo(id=lm.value, label=lm.name) for lm in mp_pose.PoseLandmark],
+            keypoint_connections=mp_pose.POSE_CONNECTIONS,
+        ),
+    )
+    # Use a separate annotation context for the segmentation mask.
+    rr.log_annotation_context(
+        "video/mask", [AnnotationInfo(id=0, label="Background"), AnnotationInfo(id=1, label="Person", color=(0, 0, 0))]
+    )
+    rr.log_view_coordinates("person", up="-Y", timeless=True)
+
+    with closing(VideoSource(video_path)) as video_source, mp_pose.Pose(enable_segmentation=segment) as pose:
+        for bgr_frame in video_source.stream_bgr():
+
+            rgb = cv2.cvtColor(bgr_frame.data, cv2.COLOR_BGR2RGB)
+            rr.set_time_seconds("time", bgr_frame.time)
+            rr.set_time_sequence("frame_idx", bgr_frame.idx)
+            rr.log_image("video/rgb", rgb)
+
+            results = pose.process(rgb)
+            h, w, _ = rgb.shape
+            landmark_positions_2d = read_landmark_positions_2d(results, w, h)
+            rr.log_points("video/pose/points", landmark_positions_2d, keypoint_ids=mp_pose.PoseLandmark)
+
+            landmark_positions_3d = read_landmark_positions_3d(results)
+            rr.log_points("person/pose/points", landmark_positions_3d, keypoint_ids=mp_pose.PoseLandmark)
+
+            segmentation_mask = results.segmentation_mask
+            if segmentation_mask is not None:
+                rr.log_segmentation_image("video/mask", segmentation_mask)
+
+@dataclass
+class VideoFrame:
+    data: npt.NDArray[np.uint8]
+    time: float
+    idx: int
+
+class VideoSource:
+    def __init__(self, path: str):
+        self.capture = cv2.VideoCapture(path)
+
+        if not self.capture.isOpened():
+            logging.error("Couldn't open video at %s", path)
+
+    def close(self) -> None:
+        self.capture.release()
+
+    def stream_bgr(self) -> Iterator[VideoFrame]:
+        while self.capture.isOpened():
+            idx = int(self.capture.get(cv2.CAP_PROP_POS_FRAMES))
+            is_open, bgr = self.capture.read()
+            time_ms = self.capture.get(cv2.CAP_PROP_POS_MSEC)
+
+            if not is_open:
+                break
+
+            yield VideoFrame(data=bgr, time=time_ms * 1e-3, idx=idx)
+
+
+
+
+def read_landmark_positions_2d(
+    results: Any,
+    image_width: int,
+    image_height: int,
+) -> Optional[npt.NDArray[np.float32]]:
+    if results.pose_landmarks is None:
+        return None
+    else:
+        normalized_landmarks = [results.pose_landmarks.landmark[lm] for lm in mp.solutions.pose.PoseLandmark]
+        # Log points as 3d points with some scaling so they "pop out" when looked at in a 3d view
+        # Negative depth in order to move them towards the camera.
+        return np.array(
+            [(image_width * lm.x, image_height * lm.y, -(lm.z + 1.0) * 300.0) for lm in normalized_landmarks]
+        )
+
+
+def read_landmark_positions_3d(
+    results: Any,
+) -> Optional[npt.NDArray[np.float32]]:
+    if results.pose_landmarks is None:
+        return None
+    else:
+        landmarks = [results.pose_world_landmarks.landmark[lm] for lm in mp.solutions.pose.PoseLandmark]
+        return np.array([(lm.x, lm.y, lm.z) for lm in landmarks])
 
